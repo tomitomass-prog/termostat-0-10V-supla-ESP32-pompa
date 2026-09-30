@@ -482,10 +482,10 @@ void scanDallasBus() {
 }
 
 // -----------------------------------------------------------------------------
-// Pompa obiegowa - czujnik wejscia zaworu jest temperatura bufora
+// BUF_OK na GPIO26 - niezalezne zezwolenie temperaturowe bufora.
+// Czujnik wejscia zaworu jest temperatura bufora.
 // -----------------------------------------------------------------------------
-bool currentHvacEnabled();  // deklaracja funkcji z sekcji regulatora
-bool pumpOutputState = false;
+bool pumpOutputState = false;  // logiczny stan BUF_OK
 bool pumpLowBufferBlocked = true;
 
 float pumpMinimumTemperatureC() {
@@ -502,38 +502,33 @@ void writePumpRelay(bool on) {
 }
 
 void runPumpControl(uint32_t now) {
-  bool desired = false;
-  const bool autoMode = pumpAutoSwitch && pumpAutoSwitch->isOn();
+  // GPIO26 jest wyjsciem BUF_OK i zalezy WYLACZNIE od temperatury bufora,
+  // Tmin oraz histerezy. Stan HVAC, zaworu 0-10 V i przelaczniki SUPLA
+  // AUTO/RECZNY nie maja wplywu na to wyjscie.
+  const bool bufferValid = sensorAddressConfigValid &&
+                           sensorIsValid(SENSOR_INLET, now);
 
-  if (!autoMode) {
-    // W trybie recznym drugi przelacznik w SUPLA bezposrednio steruje pompa.
-    desired = pumpManualSwitch && pumpManualSwitch->isOn();
+  if (!bufferValid) {
+    // Brak wiarygodnego pomiaru bufora zawsze odbiera zezwolenie.
+    pumpLowBufferBlocked = true;
   } else {
-    const bool bufferValid = sensorAddressConfigValid &&
-                             sensorIsValid(SENSOR_INLET, now);
-    const bool heatingEnabled = currentHvacEnabled();
+    const float bufferC = temperature[SENSOR_INLET].value;
+    const float tminC = pumpMinimumTemperatureC();
 
-    if (!bufferValid || !heatingEnabled) {
-      // Brak wiarygodnej temperatury lub regulator STOP -> pompa OFF.
-      desired = false;
-      pumpLowBufferBlocked = true;
-    } else {
-      const float bufferC = temperature[SENSOR_INLET].value;
-      const float tminC = pumpMinimumTemperatureC();
-
-      // Histereza: ponowne zalaczenie dopiero po Tmin + histereza.
-      if (pumpLowBufferBlocked) {
-        if (bufferC >= tminC + settings.pumpHysteresisC) {
-          pumpLowBufferBlocked = false;
-        }
-      } else if (bufferC < tminC) {
-        pumpLowBufferBlocked = true;
+    // Klasyczna histereza:
+    //   T < Tmin                -> OFF
+    //   Tmin <= T < Tmin + H    -> zachowaj poprzedni stan
+    //   T >= Tmin + H           -> ON
+    if (pumpLowBufferBlocked) {
+      if (bufferC >= tminC + settings.pumpHysteresisC) {
+        pumpLowBufferBlocked = false;
       }
-      desired = !pumpLowBufferBlocked;
+    } else if (bufferC < tminC) {
+      pumpLowBufferBlocked = true;
     }
   }
 
-  writePumpRelay(desired);
+  writePumpRelay(!pumpLowBufferBlocked);
   if (pumpStateChannel) {
     pumpStateChannel->setValue(pumpOutputState ? 1.0 : 0.0);
   }
@@ -653,12 +648,7 @@ void drawDisplay() {
       display.print(settings.pumpHysteresisC, 1);
       display.print(" C");
       display.setCursor(0, 55);
-      if (pumpAutoSwitch && pumpAutoSwitch->isOn()) {
-        display.print("AUTO ");
-      } else {
-        display.print("RECZ ");
-      }
-      display.print(pumpOutputState ? "POMPA ON" : "POMPA OFF");
+      display.print(pumpOutputState ? "BUF_OK ON" : "BUF_OK OFF");
       break;
 
     default:
@@ -923,14 +913,15 @@ void createSuplaChannels(int16_t savedSetpoint, bool savedEnabled) {
       preferences.getShort("pumptmin", DEFAULT_PUMP_TMIN_X100), 500, 9000);
   configurePumpMinThermostat(savedPumpTmin);
 
-  // Kanal 11: AUTO pompy. Kanal 12: reczne ON/OFF gdy AUTO=OFF.
+  // Kanaly 11-12 pozostawione dla zgodnosci numeracji SUPLA.
+  // Nie steruja GPIO26; BUF_OK dziala w pelni automatycznie.
   pumpAutoSwitch = new Supla::Control::VirtualRelay;
   pumpAutoSwitch->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
   pumpAutoSwitch->setDefaultStateOn();
   pumpManualSwitch = new Supla::Control::VirtualRelay;
   pumpManualSwitch->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
 
-  // Kanal 13: faktyczny stan fizycznego wyjscia pompy (0/1).
+  // Kanal 13: faktyczny logiczny stan BUF_OK na GPIO26 (0/1).
   pumpStateChannel = new Supla::Sensor::GeneralPurposeMeasurement;
   configureGpmChannel(pumpStateChannel, "", 0);
 
@@ -950,8 +941,6 @@ int16_t lastObservedSetpoint = DEFAULT_SETPOINT_X100;
 int lastObservedMode = SUPLA_HVAC_MODE_HEAT;
 bool lastObservedWeather = true;
 int16_t lastObservedPumpTmin = DEFAULT_PUMP_TMIN_X100;
-bool lastObservedPumpAuto = true;
-bool lastObservedPumpManual = false;
 
 int16_t currentSetpointX100() {
   if (!hvac) return DEFAULT_SETPOINT_X100;
@@ -972,17 +961,12 @@ void detectRuntimeStateChange(uint32_t now) {
   const bool weather = weatherSwitch && weatherSwitch->isOn();
   const int16_t pumpTmin = static_cast<int16_t>(
       lroundf(pumpMinimumTemperatureC() * 100.0f));
-  const bool pumpAuto = pumpAutoSwitch && pumpAutoSwitch->isOn();
-  const bool pumpManual = pumpManualSwitch && pumpManualSwitch->isOn();
   if (setpoint != lastObservedSetpoint || mode != lastObservedMode ||
-      weather != lastObservedWeather || pumpTmin != lastObservedPumpTmin ||
-      pumpAuto != lastObservedPumpAuto || pumpManual != lastObservedPumpManual) {
+      weather != lastObservedWeather || pumpTmin != lastObservedPumpTmin) {
     lastObservedSetpoint = setpoint;
     lastObservedMode = mode;
     lastObservedWeather = weather;
     lastObservedPumpTmin = pumpTmin;
-    lastObservedPumpAuto = pumpAuto;
-    lastObservedPumpManual = pumpManual;
     runtimeStateChangedMs = now;
     runtimeStateDirty = true;
   }
@@ -997,8 +981,6 @@ void saveRuntimeStateWhenDue(uint32_t now) {
   preferences.putBool("enabled", lastObservedMode != SUPLA_HVAC_MODE_OFF);
   preferences.putBool("weather", lastObservedWeather);
   preferences.putShort("pumptmin", lastObservedPumpTmin);
-  preferences.putBool("pumpauto", lastObservedPumpAuto);
-  preferences.putBool("pumpman", lastObservedPumpManual);
   runtimeStateDirty = false;
 }
 
@@ -1082,7 +1064,7 @@ void appSetup() {
   digitalWrite(PIN_PWM_0_10V, LOW);
   // Domyslna polaryzacja pompy to aktywny LOW, wiec HIGH = bezpieczne OFF.
   pinMode(PIN_PUMP_RELAY, OUTPUT);
-  digitalWrite(PIN_PUMP_RELAY, HIGH);
+  writePumpRelay(false);
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(100000);
@@ -1108,8 +1090,6 @@ void appSetup() {
   savedSetpoint = clampValue<int16_t>(savedSetpoint, 1000, 7000);
   const bool savedEnabled = preferences.getBool("enabled", true);
   const bool savedWeather = preferences.getBool("weather", true);
-  const bool savedPumpAuto = preferences.getBool("pumpauto", true);
-  const bool savedPumpManual = preferences.getBool("pumpman", false);
 
   createConfigurationPage();
   createSuplaChannels(savedSetpoint, savedEnabled);
@@ -1120,7 +1100,7 @@ void appSetup() {
 
   eeprom.setStateSavePeriod(5000);
   SuplaDevice.setName("Regulator pogodowy 0-10V");
-  SuplaDevice.setSwVersion("1.1.0-pump");
+  SuplaDevice.setSwVersion("1.1.2-BUF_OK");
   SuplaDevice.setCustomHostnamePrefix("SUPLA-REG-010V");
   SuplaDevice.setInitialMode(Supla::InitialMode::StartInCfgMode);
   // SuplaDevice v26.4 wymaga co najmniej protokolu 23.
@@ -1134,13 +1114,6 @@ void appSetup() {
       weatherSwitch->turnOff();
     }
   }
-  if (pumpAutoSwitch) {
-    savedPumpAuto ? pumpAutoSwitch->turnOn() : pumpAutoSwitch->turnOff();
-  }
-  if (pumpManualSwitch) {
-    savedPumpManual ? pumpManualSwitch->turnOn() : pumpManualSwitch->turnOff();
-  }
-
   loadRuntimeSettings();
   // Po odczycie polaryzacji ustaw fizyczne wyjscie pompy w stan OFF.
   writePumpRelay(false);
@@ -1161,8 +1134,6 @@ void appSetup() {
   lastObservedWeather = weatherSwitch && weatherSwitch->isOn();
   lastObservedPumpTmin = static_cast<int16_t>(
       lroundf(pumpMinimumTemperatureC() * 100.0f));
-  lastObservedPumpAuto = pumpAutoSwitch && pumpAutoSwitch->isOn();
-  lastObservedPumpManual = pumpManualSwitch && pumpManualSwitch->isOn();
 
   const uint32_t now = millis();
   lastTemperatureRequestMs = now - SENSOR_REQUEST_PERIOD_MS;
