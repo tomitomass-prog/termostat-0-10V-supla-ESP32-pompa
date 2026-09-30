@@ -1071,7 +1071,7 @@ void runControl(uint32_t now) {
 // -----------------------------------------------------------------------------
 // Setup i loop
 // -----------------------------------------------------------------------------
-void setup() {
+void appSetup() {
   Serial.begin(115200);
   delay(100);
   Serial.println();
@@ -1173,7 +1173,7 @@ void setup() {
   drawDisplay();
 }
 
-void loop() {
+void appLoop() {
   SuplaDevice.iterate();
   const uint32_t now = millis();
   serviceTemperatureBus(now);
@@ -1189,3 +1189,11 @@ void loop() {
 }
 
 }  // namespace
+
+void setup() {
+  appSetup();
+}
+
+void loop() {
+  appLoop();
+}
