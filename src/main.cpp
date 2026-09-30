@@ -7,7 +7,7 @@
  *   - OLED SSD1306 128x64 I2C, adres 0x3C
  *   - GP8403 I2C 0-10 V, adres 0x58 (preferowany)
  *     albo zewnetrzny konwerter PWM -> 0-10 V na GPIO25
- *   - przekaźnik pompy GPIO26 (polaryzacja konfigurowalna)
+ *   - przekaźnik BUF_OK GPIO26 (polaryzacja konfigurowalna)
  *   - przycisk zmiany ekranu GPIO27 -> GND
  *   - przycisk konfiguracji SUPLA GPIO0 (BOOT)
  *
@@ -103,9 +103,9 @@ Preferences preferences;
 
 Supla::Control::HvacBase *hvac = nullptr;
 Supla::Control::VirtualRelay *weatherSwitch = nullptr;
-Supla::Control::HvacBase *pumpMinThermostat = nullptr;
-Supla::Control::VirtualRelay *pumpAutoSwitch = nullptr;
-Supla::Control::VirtualRelay *pumpManualSwitch = nullptr;
+Supla::Control::HvacBase *bufferMinThermostat = nullptr;
+Supla::Sensor::GeneralPurposeMeasurement *reservedChannel11 = nullptr;
+Supla::Sensor::GeneralPurposeMeasurement *reservedChannel12 = nullptr;
 Supla::Sensor::VirtualThermometer *outletChannel = nullptr;
 Supla::Sensor::VirtualThermometer *inletChannel = nullptr;
 Supla::Sensor::VirtualThermometer *outsideChannel = nullptr;
@@ -114,7 +114,7 @@ Supla::Sensor::GeneralPurposeMeasurement *outputPercentChannel = nullptr;
 Supla::Sensor::GeneralPurposeMeasurement *outputVoltageChannel = nullptr;
 Supla::Sensor::GeneralPurposeMeasurement *alarmChannel = nullptr;
 Supla::Sensor::GeneralPurposeMeasurement *driverChannel = nullptr;
-Supla::Sensor::GeneralPurposeMeasurement *pumpStateChannel = nullptr;
+Supla::Sensor::GeneralPurposeMeasurement *bufferOkStateChannel = nullptr;
 
 // -----------------------------------------------------------------------------
 // Parametry lokalnego portalu konfiguracyjnego SUPLA
@@ -167,8 +167,8 @@ struct RuntimeSettings {
   float minimumVoltage = 0.0f;
   float maximumVoltage = 10.0f;
   uint32_t pwmFrequencyHz = 1000;
-  float pumpHysteresisC = 2.0f;
-  bool pumpRelayActiveHigh = false;  // domyslnie modul aktywny LOW
+  float bufferOkHysteresisC = 2.0f;
+  bool bufferOkActiveHigh = false;  // domyslnie wyjscie aktywne LOW
 };
 
 RuntimeSettings settings;
@@ -404,6 +404,7 @@ TemperatureState temperature[SENSOR_COUNT];
 bool temperatureRequestPending = false;
 uint32_t lastTemperatureRequestMs = 0;
 uint32_t temperatureRequestStartedMs = 0;
+bool sensorAddressValid[SENSOR_COUNT] = {true, true, true};
 bool sensorAddressConfigValid = true;
 
 void updateFilteredTemperature(TemperatureState &state,
@@ -485,52 +486,52 @@ void scanDallasBus() {
 // BUF_OK na GPIO26 - niezalezne zezwolenie temperaturowe bufora.
 // Czujnik wejscia zaworu jest temperatura bufora.
 // -----------------------------------------------------------------------------
-bool pumpOutputState = false;  // logiczny stan BUF_OK
-bool pumpLowBufferBlocked = true;
+bool bufferOkState = false;
+bool bufferTemperatureBlocked = true;
 
-float pumpMinimumTemperatureC() {
-  if (!pumpMinThermostat) return DEFAULT_PUMP_TMIN_X100 / 100.0f;
-  int value = pumpMinThermostat->getTemperatureSetpointHeat();
+float bufferMinimumTemperatureC() {
+  if (!bufferMinThermostat) return DEFAULT_PUMP_TMIN_X100 / 100.0f;
+  int value = bufferMinThermostat->getTemperatureSetpointHeat();
   if (value < 500 || value > 9000) value = DEFAULT_PUMP_TMIN_X100;
   return value / 100.0f;
 }
 
-void writePumpRelay(bool on) {
-  pumpOutputState = on;
-  const bool physicalHigh = settings.pumpRelayActiveHigh ? on : !on;
+void writeBufferOkOutput(bool on) {
+  bufferOkState = on;
+  const bool physicalHigh = settings.bufferOkActiveHigh ? on : !on;
   digitalWrite(PIN_PUMP_RELAY, physicalHigh ? HIGH : LOW);
 }
 
-void runPumpControl(uint32_t now) {
+void runBufferOkControl(uint32_t now) {
   // GPIO26 jest wyjsciem BUF_OK i zalezy WYLACZNIE od temperatury bufora,
   // Tmin oraz histerezy. Stan HVAC, zaworu 0-10 V i przelaczniki SUPLA
   // AUTO/RECZNY nie maja wplywu na to wyjscie.
-  const bool bufferValid = sensorAddressConfigValid &&
+  const bool bufferValid = sensorAddressValid[SENSOR_INLET] &&
                            sensorIsValid(SENSOR_INLET, now);
 
   if (!bufferValid) {
     // Brak wiarygodnego pomiaru bufora zawsze odbiera zezwolenie.
-    pumpLowBufferBlocked = true;
+    bufferTemperatureBlocked = true;
   } else {
     const float bufferC = temperature[SENSOR_INLET].value;
-    const float tminC = pumpMinimumTemperatureC();
+    const float tminC = bufferMinimumTemperatureC();
 
     // Klasyczna histereza:
     //   T < Tmin                -> OFF
     //   Tmin <= T < Tmin + H    -> zachowaj poprzedni stan
     //   T >= Tmin + H           -> ON
-    if (pumpLowBufferBlocked) {
-      if (bufferC >= tminC + settings.pumpHysteresisC) {
-        pumpLowBufferBlocked = false;
+    if (bufferTemperatureBlocked) {
+      if (bufferC >= tminC + settings.bufferOkHysteresisC) {
+        bufferTemperatureBlocked = false;
       }
     } else if (bufferC < tminC) {
-      pumpLowBufferBlocked = true;
+      bufferTemperatureBlocked = true;
     }
   }
 
-  writePumpRelay(!pumpLowBufferBlocked);
-  if (pumpStateChannel) {
-    pumpStateChannel->setValue(pumpOutputState ? 1.0 : 0.0);
+  writeBufferOkOutput(!bufferTemperatureBlocked);
+  if (bufferOkStateChannel) {
+    bufferOkStateChannel->setValue(bufferOkState ? 1.0 : 0.0);
   }
 }
 
@@ -641,14 +642,14 @@ void drawDisplay() {
       display.print(" C");
       display.setCursor(0, 29);
       display.print("Tmin:  ");
-      display.print(pumpMinimumTemperatureC(), 1);
+      display.print(bufferMinimumTemperatureC(), 1);
       display.print(" C");
       display.setCursor(0, 42);
       display.print("Hys:   ");
-      display.print(settings.pumpHysteresisC, 1);
+      display.print(settings.bufferOkHysteresisC, 1);
       display.print(" C");
       display.setCursor(0, 55);
-      display.print(pumpOutputState ? "BUF_OK ON" : "BUF_OK OFF");
+      display.print(bufferOkState ? "BUF_OK ON" : "BUF_OK OFF");
       break;
 
     default:
@@ -745,9 +746,9 @@ void loadRuntimeSettings() {
   }
   settings.pwmFrequencyHz = static_cast<uint32_t>(
       clampValue<int32_t>(paramPwmFrequency->getParameterValue(), 100, 20000));
-  settings.pumpHysteresisC = clampValue<float>(
+  settings.bufferOkHysteresisC = clampValue<float>(
       paramPumpHysteresis->getParameterValue(), 0.0f, 20.0f);
-  settings.pumpRelayActiveHigh =
+  settings.bufferOkActiveHigh =
       paramPumpRelayActiveHigh->getParameterValue() != 0;
   controller.setSettings(settings.control);
 
@@ -761,10 +762,19 @@ void loadRuntimeSettings() {
   ensureTextParameter(paramAddressOutside, DEFAULT_ADDR_OUTSIDE, outsideText,
                       sizeof(outsideText));
 
-  sensorAddressConfigValid =
-      parseDallasAddress(outletText, temperature[SENSOR_OUTLET].address) &&
-      parseDallasAddress(inletText, temperature[SENSOR_INLET].address) &&
+  sensorAddressValid[SENSOR_OUTLET] =
+      parseDallasAddress(outletText, temperature[SENSOR_OUTLET].address);
+  sensorAddressValid[SENSOR_INLET] =
+      parseDallasAddress(inletText, temperature[SENSOR_INLET].address);
+  sensorAddressValid[SENSOR_OUTSIDE] =
       parseDallasAddress(outsideText, temperature[SENSOR_OUTSIDE].address);
+
+  // Zbiorcza walidacja pozostaje dla regulatora mieszacza.
+  // BUF_OK korzysta tylko z sensorAddressValid[SENSOR_INLET].
+  sensorAddressConfigValid =
+      sensorAddressValid[SENSOR_OUTLET] &&
+      sensorAddressValid[SENSOR_INLET] &&
+      sensorAddressValid[SENSOR_OUTSIDE];
 
   Serial.println("Ustawienia regulatora:");
   Serial.printf("  krzywa %.2f, punkt %.1f C, korekta %.1f C\n",
@@ -780,11 +790,13 @@ void loadRuntimeSettings() {
                 settings.minimumVoltage,
                 settings.maximumVoltage,
                 settings.reverseOutput ? "tak" : "nie");
-  Serial.printf("  adresy czujnikow: %s\n",
-                sensorAddressConfigValid ? "poprawne" : "BLAD");
-  Serial.printf("  pompa: Tmin %.1f C, histereza %.1f C, aktywny %s\n",
-                pumpMinimumTemperatureC(), settings.pumpHysteresisC,
-                settings.pumpRelayActiveHigh ? "HIGH" : "LOW");
+  Serial.printf("  adresy czujnikow: OUT=%s IN/BUFOR=%s EXT=%s\n",
+                sensorAddressValid[SENSOR_OUTLET] ? "OK" : "BLAD",
+                sensorAddressValid[SENSOR_INLET] ? "OK" : "BLAD",
+                sensorAddressValid[SENSOR_OUTSIDE] ? "OK" : "BLAD");
+  Serial.printf("  BUF_OK: Tmin %.1f C, histereza %.1f C, aktywny %s\n",
+                bufferMinimumTemperatureC(), settings.bufferOkHysteresisC,
+                settings.bufferOkActiveHigh ? "HIGH" : "LOW");
 }
 
 void createConfigurationPage() {
@@ -829,9 +841,9 @@ void createConfigurationPage() {
       "pwmhz", "Czestotliwosc PWM [Hz]", 1000, 100, 20000);
 
   paramPumpHysteresis = new FloatParameter(
-      "phys", "Pompa - histereza Tmin bufora [C]", 2.0f, 0.0f, 20.0f, 1);
+      "phys", "BUF_OK - histereza Tmin bufora [C]", 2.0f, 0.0f, 20.0f, 1);
   paramPumpRelayActiveHigh = new IntParameter(
-      "ppol", "Pompa - przekaznik 1=aktywny HIGH 0=aktywny LOW", 0, 0, 1);
+      "ppol", "BUF_OK - wyjscie 1=aktywny HIGH 0=aktywny LOW", 0, 0, 1);
 
   paramAddressOutlet = new Supla::Html::CustomTextParameter(
       "addr_out", "DS18B20 wyjscie (16 HEX)", 24);
@@ -850,20 +862,20 @@ void configureGpmChannel(Supla::Sensor::GeneralPurposeMeasurement *channel,
   channel->setDefaultRefreshIntervalMs(1000);
 }
 
-void configurePumpMinThermostat(int16_t initialSetpoint) {
-  pumpMinThermostat = new Supla::Control::HvacBase();
-  pumpMinThermostat->setHeatingAndCoolingSupported(true);
-  pumpMinThermostat->setDefaultSubfunction(SUPLA_HVAC_SUBFUNCTION_HEAT);
-  pumpMinThermostat->setTemperatureRoomMin(500);
-  pumpMinThermostat->setTemperatureRoomMax(9000);
-  pumpMinThermostat->setDefaultTemperatureRoomMin(
+void configureBufferMinThermostat(int16_t initialSetpoint) {
+  bufferMinThermostat = new Supla::Control::HvacBase();
+  bufferMinThermostat->setHeatingAndCoolingSupported(true);
+  bufferMinThermostat->setDefaultSubfunction(SUPLA_HVAC_SUBFUNCTION_HEAT);
+  bufferMinThermostat->setTemperatureRoomMin(500);
+  bufferMinThermostat->setTemperatureRoomMax(9000);
+  bufferMinThermostat->setDefaultTemperatureRoomMin(
       SUPLA_CHANNELFNC_HVAC_THERMOSTAT, 500);
-  pumpMinThermostat->setDefaultTemperatureRoomMax(
+  bufferMinThermostat->setDefaultTemperatureRoomMax(
       SUPLA_CHANNELFNC_HVAC_THERMOSTAT, 9000);
-  pumpMinThermostat->setTemperatureSetpointChangeSwitchesToManualMode(true);
-  pumpMinThermostat->setTemperatureSetpointHeat(initialSetpoint);
-  pumpMinThermostat->setTargetMode(SUPLA_HVAC_MODE_HEAT);
-  new Supla::Html::HvacParameters(pumpMinThermostat);
+  bufferMinThermostat->setTemperatureSetpointChangeSwitchesToManualMode(true);
+  bufferMinThermostat->setTemperatureSetpointHeat(initialSetpoint);
+  bufferMinThermostat->setTargetMode(SUPLA_HVAC_MODE_HEAT);
+  new Supla::Html::HvacParameters(bufferMinThermostat);
 }
 
 void createSuplaChannels(int16_t savedSetpoint, bool savedEnabled) {
@@ -908,27 +920,28 @@ void createSuplaChannels(int16_t savedSetpoint, bool savedEnabled) {
   driverChannel = new Supla::Sensor::GeneralPurposeMeasurement;
   configureGpmChannel(driverChannel, "", 0);
 
-  // Kanal 10: zdalna nastawa minimalnej temperatury bufora dla pompy.
+  // Kanal 10: zdalna nastawa minimalnej temperatury bufora dla BUF_OK.
   const int16_t savedPumpTmin = clampValue<int16_t>(
       preferences.getShort("pumptmin", DEFAULT_PUMP_TMIN_X100), 500, 9000);
-  configurePumpMinThermostat(savedPumpTmin);
+  configureBufferMinThermostat(savedPumpTmin);
 
-  // Kanaly 11-12 pozostawione dla zgodnosci numeracji SUPLA.
-  // Nie steruja GPIO26; BUF_OK dziala w pelni automatycznie.
-  pumpAutoSwitch = new Supla::Control::VirtualRelay;
-  pumpAutoSwitch->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
-  pumpAutoSwitch->setDefaultStateOn();
-  pumpManualSwitch = new Supla::Control::VirtualRelay;
-  pumpManualSwitch->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
+  // Kanaly 11-12 sa tylko rezerwacja numeracji po dawnych kanalch AUTO/RECZNY.
+  // Sa tylko do odczytu i NIE steruja GPIO26.
+  reservedChannel11 = new Supla::Sensor::GeneralPurposeMeasurement;
+  configureGpmChannel(reservedChannel11, "", 0);
+  reservedChannel11->setValue(0.0);
+  reservedChannel12 = new Supla::Sensor::GeneralPurposeMeasurement;
+  configureGpmChannel(reservedChannel12, "", 0);
+  reservedChannel12->setValue(0.0);
 
   // Kanal 13: faktyczny logiczny stan BUF_OK na GPIO26 (0/1).
-  pumpStateChannel = new Supla::Sensor::GeneralPurposeMeasurement;
-  configureGpmChannel(pumpStateChannel, "", 0);
+  bufferOkStateChannel = new Supla::Sensor::GeneralPurposeMeasurement;
+  configureGpmChannel(bufferOkStateChannel, "", 0);
 
   // HvacBase ma wskazywac temperature wyjscia jako glowny pomiar.
   hvac->setMainThermometerChannelNo(1);
-  // Nastawa Tmin pompy pokazuje temperature bufora = czujnik przed zaworem.
-  pumpMinThermostat->setMainThermometerChannelNo(2);
+  // Nastawa Tmin BUF_OK pokazuje temperature bufora = czujnik przed zaworem.
+  bufferMinThermostat->setMainThermometerChannelNo(2);
 }
 
 // -----------------------------------------------------------------------------
@@ -960,7 +973,7 @@ void detectRuntimeStateChange(uint32_t now) {
   const int mode = hvac ? hvac->getMode() : SUPLA_HVAC_MODE_OFF;
   const bool weather = weatherSwitch && weatherSwitch->isOn();
   const int16_t pumpTmin = static_cast<int16_t>(
-      lroundf(pumpMinimumTemperatureC() * 100.0f));
+      lroundf(bufferMinimumTemperatureC() * 100.0f));
   if (setpoint != lastObservedSetpoint || mode != lastObservedMode ||
       weather != lastObservedWeather || pumpTmin != lastObservedPumpTmin) {
     lastObservedSetpoint = setpoint;
@@ -1045,7 +1058,7 @@ void runControl(uint32_t now) {
         lastControlResult.alarms, heating::ALARM_OUTPUT_DRIVER);
   }
   publishControlState(now);
-  runPumpControl(now);
+  runBufferOkControl(now);
   detectRuntimeStateChange(now);
   saveRuntimeStateWhenDue(now);
 }
@@ -1062,9 +1075,9 @@ void appSetup() {
   pinMode(PIN_DISPLAY_BUTTON, INPUT_PULLUP);
   pinMode(PIN_PWM_0_10V, OUTPUT);
   digitalWrite(PIN_PWM_0_10V, LOW);
-  // Domyslna polaryzacja pompy to aktywny LOW, wiec HIGH = bezpieczne OFF.
+  // Domyslna polaryzacja BUF_OK to aktywny LOW, wiec HIGH = bezpieczne OFF.
   pinMode(PIN_PUMP_RELAY, OUTPUT);
-  writePumpRelay(false);
+  writeBufferOkOutput(false);
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(100000);
@@ -1115,8 +1128,8 @@ void appSetup() {
     }
   }
   loadRuntimeSettings();
-  // Po odczycie polaryzacji ustaw fizyczne wyjscie pompy w stan OFF.
-  writePumpRelay(false);
+  // Po odczycie polaryzacji ustaw fizyczne wyjscie BUF_OK w stan OFF.
+  writeBufferOkOutput(false);
   valveOutput.begin(settings);
 
   dallas.begin();
@@ -1133,7 +1146,7 @@ void appSetup() {
   lastObservedMode = hvac ? hvac->getMode() : SUPLA_HVAC_MODE_OFF;
   lastObservedWeather = weatherSwitch && weatherSwitch->isOn();
   lastObservedPumpTmin = static_cast<int16_t>(
-      lroundf(pumpMinimumTemperatureC() * 100.0f));
+      lroundf(bufferMinimumTemperatureC() * 100.0f));
 
   const uint32_t now = millis();
   lastTemperatureRequestMs = now - SENSOR_REQUEST_PERIOD_MS;
