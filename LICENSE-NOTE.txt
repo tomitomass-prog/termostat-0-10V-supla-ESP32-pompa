@@ -1,0 +1,3 @@
+Kod projektu przygotowano dla uzytkownika. Zaleznosc SuplaDevice jest
+udostepniana na warunkach GPL-2.0-or-later; przed dystrybucja firmware nalezy
+sprawdzic i spelnic warunki licencji wszystkich zaleznosci.

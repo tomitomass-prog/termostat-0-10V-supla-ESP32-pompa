@@ -1,0 +1,6 @@
+Sterownik pogodowy SUPLA 0-10 V
+Wersja projektu: 1.1.0-pump
+Data: 2026-09-30
+Platforma docelowa: ESP32 DevKit V1 / ESP32-WROOM-32, flash 4 MB
+SuplaDevice: v26.4
+Arduino-ESP32: 3.3.6 przez pioarduino platform-espressif32 55.03.36

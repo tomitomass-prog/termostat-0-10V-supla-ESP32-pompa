@@ -1,0 +1,3 @@
+7b47b4af235e68db749eb4f0a2e130cb4f5ba1c24accc69261ffbf779d472508  platformio.ini
+5a0ff6f436818a7ae1408c38ec98fecef94a9c28f6e9747f426d23dd297d63b5  .github/workflows/build.yml
+b93d7965f1c0c3f6f99e884c9147954757bd54df4b9c339ddf038d0fe3e117cd  src/main.cpp
